@@ -45,7 +45,7 @@ if 'logs' not in st.session_state:
 @st.cache_data(ttl=15)
 def fetch_binance_data():
     try:
-        exchange = ccxt.binance({'enableRateLimit': True})
+        exchange = ccxt.kraken({'enableRateLimit': True})
         ohlcv = exchange.fetch_ohlcv('BTC/USDT', timeframe='1m', limit=120)
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
@@ -67,7 +67,7 @@ def fetch_binance_data():
 df = fetch_binance_data()
 
 if df is None or df.empty:
-    st.warning("⚠️ Binance server se connection establish ho raha hai... Thoda wait karein.")
+    st.warning("⚠️ Kraken server se connection establish ho raha hai... Thoda wait karein.")
     time.sleep(5)
     st.rerun()
 
@@ -188,6 +188,6 @@ if len(st.session_state.trade_history) > 0:
 else:
     st.write("Abhi tak koi trade complete nahi hua hai. Jaise hi bot trade execute karke close karega, yahan history dikhegi.")
 
-# Auto-refresh app every 5 seconds for smooth real-time monitoring without lag
-time.sleep(5)
+# Auto-refresh app every 4 seconds for smooth real-time monitoring without lag
+time.sleep(4)
 st.rerun()
