@@ -66,7 +66,6 @@ def fetch_and_resample_data():
     try:
         exchange = ccxt.kraken({'enableRateLimit': True})
         
-        # Fetch base 1m and 1h data to avoid rate limits
         ohlcv_1m = exchange.fetch_ohlcv(SYMBOL, timeframe='1m', limit=200)
         df_1m = pd.DataFrame(ohlcv_1m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df_1m['timestamp'] = pd.to_datetime(df_1m['timestamp'], unit='ms')
@@ -92,7 +91,6 @@ def fetch_and_resample_data():
                 'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'
             }).dropna()
             
-            # Indicators for all TFs
             resampled['ema9'] = resampled['close'].ewm(span=9, adjust=False).mean()
             resampled['ema15'] = resampled['close'].ewm(span=15, adjust=False).mean()
             
@@ -100,9 +98,10 @@ def fetch_and_resample_data():
                 resampled['high'] - resampled['low'],
                 np.maximum(abs(resampled['high'] - resampled['close'].shift(1)), abs(resampled['low'] - resampled['close'].shift(1)))
             )
-            resampled['atr'] = resampled['tr'].rolling(window=14).mean()
-            resampled['support'] = resampled['low'].rolling(window=15).min()
-            resampled['resistance'] = resampled['high'].rolling(window=15).max()
+            # Safe rolling with min_periods=1 to prevent NaN
+            resampled['atr'] = resampled['tr'].rolling(window=14, min_periods=1).mean().fillna(value=10.0)
+            resampled['support'] = resampled['low'].rolling(window=15, min_periods=1).min().fillna(value=resampled['low'] * 0.99)
+            resampled['resistance'] = resampled['high'].rolling(window=15, min_periods=1).max().fillna(value=resampled['high'] * 1.01)
             
             resampled_data[tf_name] = resampled
             
@@ -149,13 +148,12 @@ if tf_data is not None:
 
     st.divider()
 
-    # Analyze all 15 timeframes
     tf_trends = {}
     bullish_count = 0
     bearish_count = 0
     
     for tf, df in tf_data.items():
-        if len(df) > 1:
+        if len(df) > 0:
             e9 = df['ema9'].iloc[-1]
             e15 = df['ema15'].iloc[-1]
             trend = "BULLISH" if e9 > e15 else "BEARISH"
@@ -166,8 +164,8 @@ if tf_data is not None:
                 bearish_count += 1
 
     df_15m = tf_data.get('15min')
-    range_high = df_15m['resistance'].iloc[-1] if df_15m is not None else live_price
-    range_low = df_15m['support'].iloc[-1] if df_15m is not None else live_price
+    range_high = df_15m['resistance'].iloc[-1] if df_15m is not None else live_price * 1.01
+    range_low = df_15m['support'].iloc[-1] if df_15m is not None else live_price * 0.99
     range_pct = ((range_high - range_low) / live_price) * 100
     is_sideways = range_pct < 0.6
 
@@ -182,11 +180,10 @@ if tf_data is not None:
         if consecutive_losses >= 2 and is_sideways:
             st.warning("🛑 *Cool-down Active:* 2 consecutive losses + Sideways market detected. Bot is holding fire.")
         elif not is_sideways:
-            # Require at least 12 out of 15 timeframes to agree
             if bullish_count >= 12:
-                support_val = df_15m['support'].iloc[-2] if df_15m is not None else live_price * 0.99
-                dist_support = ((live_price - support_val) / live_price) * 100
-                final_sl_pct = min(max(dist_support, 0.2), 1.0)
+                support_val = df_15m['support'].iloc[-1] if df_15m is not None else live_price * 0.99
+                dist_support = max(((live_price - support_val) / live_price) * 100, 0.2)
+                final_sl_pct = min(dist_support, 1.0)
                 sl_price = live_price * (1 - (final_sl_pct / 100.0))
                 
                 st.session_state.active_trade = {
@@ -199,9 +196,9 @@ if tf_data is not None:
                 }
                 st.rerun()
             elif bearish_count >= 12:
-                resistance_val = df_15m['resistance'].iloc[-2] if df_15m is not None else live_price * 1.01
-                dist_res = ((resistance_val - live_price) / live_price) * 100
-                final_sl_pct = min(max(dist_res, 0.2), 1.0)
+                resistance_val = df_15m['resistance'].iloc[-1] if df_15m is not None else live_price * 1.01
+                dist_res = max(((resistance_val - live_price) / live_price) * 100, 0.2)
+                final_sl_pct = min(dist_res, 1.0)
                 sl_price = live_price * (1 + (final_sl_pct / 100.0))
                 
                 st.session_state.active_trade = {
@@ -227,7 +224,7 @@ if tf_data is not None:
         col_t2.write(f"*Trailing SL:* ${trade['sl_price']:,.2f}")
         col_t3.write(f"*Position Size:* ${trade['position_size']:.2f}")
 
-        atr_val = df_15m['atr'].iloc[-1] if df_15m is not None else 100.0
+        atr_val = df_15m['atr'].iloc[-1] if df_15m is not None else 50.0
 
         if trade['side'] == "BUY":
             if live_price > trade['peak_price']:
