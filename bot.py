@@ -11,7 +11,7 @@ from datetime import datetime
 # 1. STREAMLIT PAGE CONFIG & SETUP
 # ==========================================
 st.set_page_config(
-    page_title="AI Alpha Pro Bot (Elon Musk Multi-TF Edition)",
+    page_title="AI Alpha Pro Bot (Elon Musk Ultimate Edition)",
     page_icon="⚡",
     layout="centered"
 )
@@ -59,7 +59,7 @@ def get_consecutive_losses(history):
 consecutive_losses = get_consecutive_losses(st.session_state.trade_history)
 
 # ==========================================
-# 3. 15-TIMEFRAME RESAMPLING & AI ENGINE
+# 3. 15-TIMEFRAME RESAMPLING & STRICT AI ENGINE
 # ==========================================
 @st.cache_data(ttl=12)
 def fetch_and_resample_data():
@@ -91,14 +91,39 @@ def fetch_and_resample_data():
                 'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'
             }).dropna()
             
-            resampled['ema9'] = resampled['close'].ewm(span=9, adjust=False).mean()
-            resampled['ema15'] = resampled['close'].ewm(span=15, adjust=False).mean()
+            # Strict Multi-Indicators Setup
+            # 1. DEMA (Double EMA 9 & 15)
+            ema9 = resampled['close'].ewm(span=9, adjust=False).mean()
+            dema9 = 2 * ema9 - ema9.ewm(span=9, adjust=False).mean()
             
+            ema15 = resampled['close'].ewm(span=15, adjust=False).mean()
+            dema15 = 2 * ema15 - ema15.ewm(span=15, adjust=False).mean()
+            
+            resampled['dema9'] = dema9
+            resampled['dema15'] = dema15
+
+            # 2. RSI 14
+            delta = resampled['close'].diff()
+            gain = (delta.where(delta > 0, 0)).rolling(window=14, min_periods=1).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(window=14, min_periods=1).mean()
+            rs = gain / (loss + 1e-10)
+            resampled['rsi'] = 100 - (100 / (1 + rs))
+
+            # 3. Stochastic RSI (14, 14, 3, 3)
+            rsi_min = resampled['rsi'].rolling(window=14, min_periods=1).min()
+            rsi_max = resampled['rsi'].rolling(window=14, min_periods=1).max()
+            stoch_rsi = (resampled['rsi'] - rsi_min) / ((rsi_max - rsi_min) + 1e-10)
+            resampled['stoch_k'] = stoch_rsi.rolling(window=3, min_periods=1).mean() * 100
+            resampled['stoch_d'] = resampled['stoch_k'].rolling(window=3, min_periods=1).mean()
+
+            # 4. Volume SMA 20 (Volume confirmation)
+            resampled['vol_sma'] = resampled['volume'].rolling(window=20, min_periods=1).mean()
+
+            # Safe ATR & Support/Resistance (Fixed NaN Issue)
             resampled['tr'] = np.maximum(
                 resampled['high'] - resampled['low'],
                 np.maximum(abs(resampled['high'] - resampled['close'].shift(1)), abs(resampled['low'] - resampled['close'].shift(1)))
             )
-            # Safe rolling with min_periods=1 to prevent NaN
             resampled['atr'] = resampled['tr'].rolling(window=14, min_periods=1).mean().fillna(value=10.0)
             resampled['support'] = resampled['low'].rolling(window=15, min_periods=1).min().fillna(value=resampled['low'] * 0.99)
             resampled['resistance'] = resampled['high'].rolling(window=15, min_periods=1).max().fillna(value=resampled['high'] * 1.01)
@@ -114,8 +139,8 @@ tf_data = fetch_and_resample_data()
 # ==========================================
 # 4. DASHBOARD HEADER & METRICS
 # ==========================================
-st.title("⚡ AI Alpha Pro Bot (Elon Musk Multi-TF Edition)")
-st.caption("15 Timeframes Confluence (1m to 1week) | Auto-Sideways Detector | Max 1% Strict SL")
+st.title("⚡ AI Alpha Pro Bot (Elon Musk Ultimate Edition)")
+st.caption("15 Timeframes Confluence | DEMA + RSI + Stoch RSI + Volume | Auto-Sideways Detector | Max 1% Strict SL")
 
 col_sys1, col_sys2 = st.columns(2)
 with col_sys1:
@@ -154,14 +179,30 @@ if tf_data is not None:
     
     for tf, df in tf_data.items():
         if len(df) > 0:
-            e9 = df['ema9'].iloc[-1]
-            e15 = df['ema15'].iloc[-1]
-            trend = "BULLISH" if e9 > e15 else "BEARISH"
-            tf_trends[tf] = trend
-            if trend == "BULLISH":
+            d9 = df['dema9'].iloc[-1]
+            d15 = df['dema15'].iloc[-1]
+            rsi = df['rsi'].iloc[-1]
+            stoch_k = df['stoch_k'].iloc[-1]
+            stoch_d = df['stoch_d'].iloc[-1]
+            vol = df['volume'].iloc[-1]
+            vol_sma = df['vol_sma'].iloc[-1]
+
+            # STRICT BULLISH RULE: DEMA Cross + RSI > 50 + Stoch RSI Cross + Volume > Average
+            is_bullish = (d9 > d15) and (rsi > 50) and (stoch_k > stoch_d) and (vol >= vol_sma * 0.8)
+            
+            # STRICT BEARISH RULE: DEMA Cross + RSI < 50 + Stoch RSI Cross + Volume > Average
+            is_bearish = (d9 < d15) and (rsi < 50) and (stoch_k < stoch_d) and (vol >= vol_sma * 0.8)
+
+            if is_bullish:
+                trend = "BULLISH 🚀"
                 bullish_count += 1
-            else:
+            elif is_bearish:
+                trend = "BEARISH 📉"
                 bearish_count += 1
+            else:
+                trend = "NEUTRAL ⏳"
+
+            tf_trends[tf] = trend
 
     df_15m = tf_data.get('15min')
     range_high = df_15m['resistance'].iloc[-1] if df_15m is not None else live_price * 1.01
@@ -170,9 +211,9 @@ if tf_data is not None:
     is_sideways = range_pct < 0.6
 
     if st.session_state.active_trade is None:
-        st.subheader("🌐 15-Timeframe AI Confluence Matrix")
+        st.subheader("🌐 15-Timeframe Strict Confluence Matrix")
         
-        tf_df_display = pd.DataFrame(list(tf_trends.items()), columns=['Timeframe', 'Detected Trend'])
+        tf_df_display = pd.DataFrame(list(tf_trends.items()), columns=['Timeframe', 'AI Signal'])
         st.dataframe(tf_df_display.set_index('Timeframe').T, use_container_width=True)
         
         st.write(f"*Market State:* {'SIDEWAYS ZONE ⚠️ (No Trade)' if is_sideways else 'TRENDING 🚀'} | *Range:* {range_pct:.2f}%")
@@ -211,7 +252,7 @@ if tf_data is not None:
                 }
                 st.rerun()
             else:
-                st.info("⏳ Waiting for high multi-timeframe consensus (at least 12/15 TFs must align)...")
+                st.info("⏳ Waiting for strict multi-timeframe consensus (at least 12/15 TFs must align with DEMA, RSI & Volume)...")
         else:
             st.info("⚠️ Market is consolidating. AI bot waiting for clean breakout.")
             
