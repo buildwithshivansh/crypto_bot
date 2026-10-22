@@ -1,318 +1,196 @@
-import streamlit as st
 import ccxt
-import pandas as pd
 import numpy as np
+import pandas as pd
+from sklearn.ensemble import RandomForestClassifier
 import time
-import json
-import os
-from datetime import datetime
 
 # ==========================================
-# 1. STREAMLIT PAGE CONFIG & SETUP
+# 1. PARAMETERS & CONFIGURATION
 # ==========================================
-st.set_page_config(
-    page_title="AI Alpha Pro Bot (Elon Musk Ultimate Edition)",
-    page_icon="⚡",
-    layout="centered"
-)
-
-HISTORY_FILE = "trade_history.json"
 SYMBOL = "BTC/USDT"
-INITIAL_CAPITAL = 100.0
+TIMEFRAME_MICRO = "5m"
+TIMEFRAME_MACRO = "1h"
+RISK_REWARD_RATIO = 1.5           # 1 : 1.5 RR
+ML_CONFIDENCE_THRESHOLD = 0.62    # Minimum 62% ML probability
+FEE_DISCOUNT_MAKER_RATE = 0.00012 # ~0.012% Discounted Maker Fee Rate
+
+# Initialize Exchange (Using public CCXT fetch for Binance Testnet / Live data)
+exchange = ccxt.binance({
+    'enableRateLimit': True,
+    'options': {'defaultType': 'future'} # Futures market setup
+})
 
 # ==========================================
-# 2. PERMANENT DATA STORAGE (JSON)
+# 2. DATA FETCHER & INDICATORS (CCXT)
 # ==========================================
-def load_history():
-    if os.path.exists(HISTORY_FILE):
-        try:
-            with open(HISTORY_FILE, "r") as f:
-                return json.load(f)
-        except Exception:
-            return []
-    return []
-
-def save_trade_to_history(trade):
-    history = load_history()
-    history.append(trade)
-    with open(HISTORY_FILE, "w") as f:
-        json.dump(history, f, indent=4)
-
-if "trade_history" not in st.session_state:
-    st.session_state.trade_history = load_history()
-
-if "active_trade" not in st.session_state:
-    st.session_state.active_trade = None
-
-realized_pnl = sum([t.get("pnl_usd", 0.0) for t in st.session_state.trade_history])
-current_total_capital = INITIAL_CAPITAL + realized_pnl
-
-def get_consecutive_losses(history):
-    count = 0
-    for trade in reversed(history):
-        if trade.get("pnl_usd", 0.0) < 0:
-            count += 1
-        else:
-            break
-    return count
-
-consecutive_losses = get_consecutive_losses(st.session_state.trade_history)
-
-# ==========================================
-# 3. 15-TIMEFRAME RESAMPLING & STRICT AI ENGINE
-# ==========================================
-@st.cache_data(ttl=12)
-def fetch_and_resample_data():
+def fetch_live_data():
+    """Fetches real-time OHLCV candles from the exchange via CCXT."""
     try:
-        exchange = ccxt.kraken({'enableRateLimit': True})
+        print(f"🔄 Fetching live data for {SYMBOL}...")
         
-        ohlcv_1m = exchange.fetch_ohlcv(SYMBOL, timeframe='1m', limit=200)
-        df_1m = pd.DataFrame(ohlcv_1m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df_1m['timestamp'] = pd.to_datetime(df_1m['timestamp'], unit='ms')
-        df_1m.set_index('timestamp', inplace=True)
+        # Fetch 5-minute candles (Micro timeframe)
+        ohlcv_5m = exchange.fetch_ohlcv(SYMBOL, timeframe=TIMEFRAME_MICRO, limit=200)
+        df_5m = pd.DataFrame(ohlcv_5m, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df_5m['timestamp'] = pd.to_datetime(df_5m['timestamp'], unit='ms')
+        df_5m.set_index('timestamp', inplace=True)
         
-        ohlcv_1h = exchange.fetch_ohlcv(SYMBOL, timeframe='1h', limit=200)
+        # Fetch 1-hour candles (Macro timeframe)
+        ohlcv_1h = exchange.fetch_ohlcv(SYMBOL, timeframe=TIMEFRAME_MACRO, limit=100)
         df_1h = pd.DataFrame(ohlcv_1h, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df_1h['timestamp'] = pd.to_datetime(df_1h['timestamp'], unit='ms')
         df_1h.set_index('timestamp', inplace=True)
         
-        timeframes_rules = {
-            '1min': '1min', '3min': '3min', '5min': '5min', '10min': '10min',
-            '15min': '15min', '30min': '30min', '45min': '45min',
-            '1hr': '1h', '2hr': '2h', '3hr': '3h', '4hr': '4h',
-            '6hr': '6h', '12hr': '12h', '1day': '1d', '1week': '1W'
+        return df_5m, df_1h
+    except Exception as e:
+        print(f"❌ Error fetching data from exchange: {e}")
+        return None, None
+
+def calculate_atr(df, period=14):
+    """Calculate Average True Range for dynamic volatility stop-loss/take-profit."""
+    df['high_low'] = df['high'] - df['low']
+    df['high_close'] = np.abs(df['high'] - df['close'].shift())
+    df['low_close'] = np.abs(df['low'] - df['close'].shift())
+    df['tr'] = df[['high_low', 'high_close', 'low_close']].max(axis=1)
+    df['atr'] = df['tr'].rolling(window=period).mean()
+    return df
+
+def generate_multi_timeframe_features(df_5m, df_1h):
+    """Build multi-timeframe feature matrix: 1H trend + 5M momentum & ATR."""
+    df = df_5m.copy()
+    
+    # Micro features (5-minute)
+    df['returns_5m'] = df['close'].pct_change()
+    df['volatility_5m'] = df['returns_5m'].rolling(window=12).std()
+    df['ema_fast'] = df['close'].ewm(span=9, adjust=False).mean()
+    df['ema_slow'] = df['close'].ewm(span=21, adjust=False).mean()
+    df['ema_diff_5m'] = df['ema_fast'] - df['ema_slow']
+    
+    # ATR Calculation
+    df = calculate_atr(df)
+    
+    # Macro feature (1-Hour Trend Alignment)
+    df_1h['ema_1h'] = df_1h['close'].ewm(span=50, adjust=False).mean()
+    df_1h['macro_trend'] = np.where(df_1h['close'] > df_1h['ema_1h'], 1, -1)
+    
+    # Merge Macro trend into 5M dataframe
+    df = df.join(df_1h[['macro_trend']], how='left').ffill()
+    
+    # Target variable for ML training
+    df['target'] = np.where(df['close'].shift(-3) > df['close'], 1, 0)
+    
+    return df.dropna()
+
+# ==========================================
+# 3. MACHINE LEARNING MODEL TRAINER
+# ==========================================
+def train_quant_model(df):
+    features = ['returns_5m', 'volatility_5m', 'ema_diff_5m', 'atr', 'macro_trend']
+    X = df[features]
+    y = df['target']
+    
+    model = RandomForestClassifier(n_estimators=100, max_depth=5, random_state=42)
+    model.fit(X, y)
+    return model, features
+
+# ==========================================
+# 4. EXECUTION ENGINE (1:1.5 RR + CIRCUIT BREAKER)
+# ==========================================
+class QuantExecutionEngine:
+    def _init_(self, capital=100.0, position_ratio=0.8):
+        self.capital = capital
+        self.position_ratio = position_ratio
+        self.active_position = None
+        self.consecutive_losses = 0
+        self.shutdown_until = None
+
+    def check_circuit_breaker(self):
+        """Checks if the bot is locked out due to 3 consecutive losses."""
+        if self.shutdown_until and time.time() < self.shutdown_until:
+            remaining_minutes = int((self.shutdown_until - time.time()) / 60)
+            print(f"🛑 [CIRCUIT BREAKER ACTIVE] System locked for {remaining_minutes} more minutes.")
+            return True
+        elif self.shutdown_until and time.time() >= self.shutdown_until:
+            print("🟢 [CIRCUIT BREAKER] Cooldown expired. Resuming trading operations.")
+            self.shutdown_until = None
+            self.consecutive_losses = 0
+        return False
+
+    def record_trade_outcome(self, is_win):
+        """Updates consecutive loss counter and locks system if threshold met."""
+        if is_win:
+            print("✅ [TRADE WON] Resetting consecutive loss counter.")
+            self.consecutive_losses = 0
+        else:
+            self.consecutive_losses += 1
+            print(f"⚠️ [TRADE LOST] Consecutive losses count: {self.consecutive_losses}/3")
+            if self.consecutive_losses >= 3:
+                self.shutdown_until = time.time() + (12 * 3600)
+                print("🚨 [CRITICAL ALERT] 3 consecutive losses hit! System shutting down for 12 hours.")
+
+    def execute_trade_with_sl_tp(self, current_price, atr_value, signal_type):
+        """Executes a Limit Maker order with rigid Stop-Loss and Take-Profit bounds."""
+        if self.check_circuit_breaker():
+            return
+            
+        stop_loss_distance = atr_value * 1.5
+        take_profit_distance = stop_loss_distance * RISK_REWARD_RATIO
+        
+        if signal_type == "BUY":
+            entry_price = current_price
+            stop_loss = entry_price - stop_loss_distance
+            take_profit = entry_price + take_profit_distance
+        else:
+            entry_price = current_price
+            stop_loss = entry_price + stop_loss_distance
+            take_profit = entry_price - take_profit_distance
+            
+        position_size = self.capital * self.position_ratio
+        
+        self.active_position = {
+            'type': signal_type,
+            'entry_price': entry_price,
+            'stop_loss': stop_loss,
+            'take_profit': take_profit,
+            'position_size': position_size,
+            'status': 'OPEN'
         }
         
-        resampled_data = {}
-        for tf_name, rule in timeframes_rules.items():
-            base_df = df_1m if tf_name in ['1min', '3min', '5min', '10min', '15min', '30min', '45min'] else df_1h
-            
-            resampled = base_df.resample(rule).agg({
-                'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'
-            }).dropna()
-            
-            # Strict Multi-Indicators Setup
-            # 1. DEMA (Double EMA 9 & 15)
-            ema9 = resampled['close'].ewm(span=9, adjust=False).mean()
-            dema9 = 2 * ema9 - ema9.ewm(span=9, adjust=False).mean()
-            
-            ema15 = resampled['close'].ewm(span=15, adjust=False).mean()
-            dema15 = 2 * ema15 - ema15.ewm(span=15, adjust=False).mean()
-            
-            resampled['dema9'] = dema9
-            resampled['dema15'] = dema15
-
-            # 2. RSI 14
-            delta = resampled['close'].diff()
-            gain = (delta.where(delta > 0, 0)).rolling(window=14, min_periods=1).mean()
-            loss = (-delta.where(delta < 0, 0)).rolling(window=14, min_periods=1).mean()
-            rs = gain / (loss + 1e-10)
-            resampled['rsi'] = 100 - (100 / (1 + rs))
-
-            # 3. Stochastic RSI (14, 14, 3, 3)
-            rsi_min = resampled['rsi'].rolling(window=14, min_periods=1).min()
-            rsi_max = resampled['rsi'].rolling(window=14, min_periods=1).max()
-            stoch_rsi = (resampled['rsi'] - rsi_min) / ((rsi_max - rsi_min) + 1e-10)
-            resampled['stoch_k'] = stoch_rsi.rolling(window=3, min_periods=1).mean() * 100
-            resampled['stoch_d'] = resampled['stoch_k'].rolling(window=3, min_periods=1).mean()
-
-            # 4. Volume SMA 20 (Volume confirmation)
-            resampled['vol_sma'] = resampled['volume'].rolling(window=20, min_periods=1).mean()
-
-            # Safe ATR & Support/Resistance (Fixed NaN Issue)
-            resampled['tr'] = np.maximum(
-                resampled['high'] - resampled['low'],
-                np.maximum(abs(resampled['high'] - resampled['close'].shift(1)), abs(resampled['low'] - resampled['close'].shift(1)))
-            )
-            resampled['atr'] = resampled['tr'].rolling(window=14, min_periods=1).mean().fillna(value=10.0)
-            resampled['support'] = resampled['low'].rolling(window=15, min_periods=1).min().fillna(value=resampled['low'] * 0.99)
-            resampled['resistance'] = resampled['high'].rolling(window=15, min_periods=1).max().fillna(value=resampled['high'] * 1.01)
-            
-            resampled_data[tf_name] = resampled
-            
-        return resampled_data
-    except Exception as e:
-        return None
-
-tf_data = fetch_and_resample_data()
+        print("=" * 60)
+        print(f"🚀 [ORDER EXECUTED - LIMIT MAKER]")
+        print(f"Type        : {signal_type}")
+        print(f"Entry Price : ${entry_price:.2f}")
+        print(f"Stop Loss   : ${stop_loss:.2f} (Risk: ${stop_loss_distance:.2f})")
+        print(f"Take Profit : ${take_profit:.2f} (Reward: ${take_profit_distance:.2f})")
+        print(f"RR Ratio    : 1 : {RISK_REWARD_RATIO}")
+        print("=" * 60)
 
 # ==========================================
-# 4. DASHBOARD HEADER & METRICS
+# 5. MAIN EXECUTION LOOP
 # ==========================================
-st.title("⚡ AI Alpha Pro Bot (Elon Musk Ultimate Edition)")
-st.caption("15 Timeframes Confluence | DEMA + RSI + Stoch RSI + Volume | Auto-Sideways Detector | Max 1% Strict SL")
-
-col_sys1, col_sys2 = st.columns(2)
-with col_sys1:
-    st.markdown("*AI Multi-TF Status:* ONLINE & SCANNING 🟢")
-with col_sys2:
-    st.markdown(f"*Last Refreshed:* {datetime.now().strftime('%H:%M:%S IST')}")
-
-st.divider()
-
-if tf_data is not None:
-    live_price = tf_data['1min']['close'].iloc[-1]
+if _name_ == "_main_":
+    # Fetch live data from exchange
+    df_5m, df_1h = fetch_live_data()
     
-    active_pnl_usd = 0.0
-    active_pnl_pct = 0.0
-    
-    if st.session_state.active_trade is not None:
-        trade = st.session_state.active_trade
-        entry_price = trade['entry_price']
-        if trade['side'] == "BUY":
-            active_pnl_pct = ((live_price - entry_price) / entry_price) * 100
+    if df_5m is not None and df_1h is not None:
+        # Process features & train model
+        data = generate_multi_timeframe_features(df_5m, df_1h)
+        model, feature_cols = train_quant_model(data)
+        
+        # Initialize Engine with $100 virtual capital
+        engine = QuantExecutionEngine(capital=100.0)
+        
+        # Predict on latest market bar
+        latest_bar = data[feature_cols].iloc[[-1]]
+        latest_price = data['close'].iloc[-1]
+        latest_atr = data['atr'].iloc[-1]
+        
+        probs = model.predict_proba(latest_bar)[0] # [Prob_Loss, Prob_Win]
+        win_prob = probs[1]
+        
+        print(f"\n📊 Latest Market Signal Confidence: {win_prob * 100:.2f}%")
+        
+        # Execute only if High Conviction
+        if win_prob >= ML_CONFIDENCE_THRESHOLD:
+            engine.execute_trade_with_sl_tp(latest_price, latest_atr, signal_type="BUY")
         else:
-            active_pnl_pct = ((entry_price - live_price) / entry_price) * 100
-        active_pnl_usd = (trade['position_size'] * active_pnl_pct) / 100
-
-    col_m1, col_m2, col_m3, col_m4 = st.columns(4)
-    col_m1.metric("Total Capital", f"${current_total_capital + active_pnl_usd:.2f}", f"${realized_pnl + active_pnl_usd:+.2f}")
-    col_m2.metric("Live BTC", f"${live_price:,.2f}")
-    col_m3.metric("Running PnL", f"{active_pnl_pct:+.2f}%", f"${active_pnl_usd:+.2f}")
-    col_m4.metric("Loss Streak", f"{consecutive_losses} / 2", "Cool-down Limit")
-
-    st.divider()
-
-    tf_trends = {}
-    bullish_count = 0
-    bearish_count = 0
-    
-    for tf, df in tf_data.items():
-        if len(df) > 0:
-            d9 = df['dema9'].iloc[-1]
-            d15 = df['dema15'].iloc[-1]
-            rsi = df['rsi'].iloc[-1]
-            stoch_k = df['stoch_k'].iloc[-1]
-            stoch_d = df['stoch_d'].iloc[-1]
-            vol = df['volume'].iloc[-1]
-            vol_sma = df['vol_sma'].iloc[-1]
-
-            # STRICT BULLISH RULE: DEMA Cross + RSI > 50 + Stoch RSI Cross + Volume > Average
-            is_bullish = (d9 > d15) and (rsi > 50) and (stoch_k > stoch_d) and (vol >= vol_sma * 0.8)
-            
-            # STRICT BEARISH RULE: DEMA Cross + RSI < 50 + Stoch RSI Cross + Volume > Average
-            is_bearish = (d9 < d15) and (rsi < 50) and (stoch_k < stoch_d) and (vol >= vol_sma * 0.8)
-
-            if is_bullish:
-                trend = "BULLISH 🚀"
-                bullish_count += 1
-            elif is_bearish:
-                trend = "BEARISH 📉"
-                bearish_count += 1
-            else:
-                trend = "NEUTRAL ⏳"
-
-            tf_trends[tf] = trend
-
-    df_15m = tf_data.get('15min')
-    range_high = df_15m['resistance'].iloc[-1] if df_15m is not None else live_price * 1.01
-    range_low = df_15m['support'].iloc[-1] if df_15m is not None else live_price * 0.99
-    range_pct = ((range_high - range_low) / live_price) * 100
-    is_sideways = range_pct < 0.6
-
-    if st.session_state.active_trade is None:
-        st.subheader("🌐 15-Timeframe Strict Confluence Matrix")
-        
-        tf_df_display = pd.DataFrame(list(tf_trends.items()), columns=['Timeframe', 'AI Signal'])
-        st.dataframe(tf_df_display.set_index('Timeframe').T, use_container_width=True)
-        
-        st.write(f"*Market State:* {'SIDEWAYS ZONE ⚠️ (No Trade)' if is_sideways else 'TRENDING 🚀'} | *Range:* {range_pct:.2f}%")
-
-        if consecutive_losses >= 2 and is_sideways:
-            st.warning("🛑 *Cool-down Active:* 2 consecutive losses + Sideways market detected. Bot is holding fire.")
-        elif not is_sideways:
-            if bullish_count >= 12:
-                support_val = df_15m['support'].iloc[-1] if df_15m is not None else live_price * 0.99
-                dist_support = max(((live_price - support_val) / live_price) * 100, 0.2)
-                final_sl_pct = min(dist_support, 1.0)
-                sl_price = live_price * (1 - (final_sl_pct / 100.0))
-                
-                st.session_state.active_trade = {
-                    "side": "BUY",
-                    "entry_price": live_price,
-                    "position_size": current_total_capital,
-                    "sl_price": sl_price,
-                    "peak_price": live_price,
-                    "entry_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                }
-                st.rerun()
-            elif bearish_count >= 12:
-                resistance_val = df_15m['resistance'].iloc[-1] if df_15m is not None else live_price * 1.01
-                dist_res = max(((resistance_val - live_price) / live_price) * 100, 0.2)
-                final_sl_pct = min(dist_res, 1.0)
-                sl_price = live_price * (1 + (final_sl_pct / 100.0))
-                
-                st.session_state.active_trade = {
-                    "side": "SELL",
-                    "entry_price": live_price,
-                    "position_size": current_total_capital,
-                    "sl_price": sl_price,
-                    "peak_price": live_price,
-                    "entry_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                }
-                st.rerun()
-            else:
-                st.info("⏳ Waiting for strict multi-timeframe consensus (at least 12/15 TFs must align with DEMA, RSI & Volume)...")
-        else:
-            st.info("⚠️ Market is consolidating. AI bot waiting for clean breakout.")
-            
-    else:
-        trade = st.session_state.active_trade
-        st.subheader(f"⚡ Active AI Position: {trade['side']} MODE")
-        
-        col_t1, col_t2, col_t3 = st.columns(3)
-        col_t1.write(f"*Entry Price:* ${trade['entry_price']:,.2f}")
-        col_t2.write(f"*Trailing SL:* ${trade['sl_price']:,.2f}")
-        col_t3.write(f"*Position Size:* ${trade['position_size']:.2f}")
-
-        atr_val = df_15m['atr'].iloc[-1] if df_15m is not None else 50.0
-
-        if trade['side'] == "BUY":
-            if live_price > trade['peak_price']:
-                trade['peak_price'] = live_price
-                trade['sl_price'] = max(trade['sl_price'], live_price - (1.5 * atr_val))
-
-            if live_price <= trade['sl_price']:
-                pnl_pct = ((live_price - trade['entry_price']) / trade['entry_price']) * 100
-                pnl_usd = (trade['position_size'] * pnl_pct) / 100
-                completed = {
-                    "side": "BUY", "entry_price": trade['entry_price'], "exit_price": live_price,
-                    "entry_time": trade['entry_time'], "exit_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "pnl_pct": round(pnl_pct, 2), "pnl_usd": round(pnl_usd, 2)
-                }
-                save_trade_to_history(completed)
-                st.session_state.trade_history = load_history()
-                st.session_state.active_trade = None
-                st.rerun()
-
-        elif trade['side'] == "SELL":
-            if live_price < trade['peak_price']:
-                trade['peak_price'] = live_price
-                trade['sl_price'] = min(trade['sl_price'], live_price + (1.5 * atr_val))
-
-            if live_price >= trade['sl_price']:
-                pnl_pct = ((trade['entry_price'] - live_price) / trade['entry_price']) * 100
-                pnl_usd = (trade['position_size'] * pnl_pct) / 100
-                completed = {
-                    "side": "SELL", "entry_price": trade['entry_price'], "exit_price": live_price,
-                    "entry_time": trade['entry_time'], "exit_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "pnl_pct": round(pnl_pct, 2), "pnl_usd": round(pnl_usd, 2)
-                }
-                save_trade_to_history(completed)
-                st.session_state.trade_history = load_history()
-                st.session_state.active_trade = None
-                st.rerun()
-
-st.divider()
-st.subheader("📜 Permanent Trade History & Logs")
-history_data = load_history()
-if len(history_data) > 0:
-    hist_df = pd.DataFrame(history_data)
-    hist_df = hist_df[['entry_time', 'exit_time', 'side', 'entry_price', 'exit_price', 'pnl_pct', 'pnl_usd']]
-    hist_df.columns = ['Entry Time', 'Exit Time', 'Type', 'Entry ($)', 'Exit ($)', 'PnL (%)', 'PnL ($)']
-    st.dataframe(hist_df, use_container_width=True)
-else:
-    st.info("No completed trades recorded yet. History saves permanently in trade_history.json.")
-
-time.sleep(15)
-st.rerun()
+            print("⚠️ Signal below threshold (Low Conviction). No trade executed.")
